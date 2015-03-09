@@ -165,15 +165,16 @@ private def pageConfigure() {
             section("${name} Mode", hideable:true, hidden:false) {
                 name = name.tr(' !+', '___')
                 settings.hues?.each() {
-                    input "${it.id}_${name}", "number", title: "${it.displayName} Level", required:false
+                    input it.id + "_" + name, "number", title: "${it.displayName} Level", required:false
                     input "${it.id}_${name}_color", "enum", title: "${it.displayName} Color?", required: false, multiple:false, metadata: [values:
 					["Normal", "Daylight", "Soft", "Warm", "Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink"]]
                 }
                 settings.dimmers?.each() {
                     input "${it.id}_${name}", "number", title: "${it.displayName} Level", required:false
+                    input "${it.id}_${name}_gentle", "bool", title: "${it.displayName} Gentle", defaultValue: true, required:false
                 }
                 settings.switches?.each() {
-                    input "${it.id}_${name}", "enum", title:it.displayName,
+                    input  it.id + "_" + name, "enum", title:it.displayName,
                         metadata:[values: ["on", "off"]], required:false
                 }
             }
@@ -206,6 +207,7 @@ def onLocation(evt) {
 
 	if (state.lastMode != state.currentMode) {
     
+        state.pendingGentleUpdate = [:]
 	    def allSwitches = []
     	if (settings.hues)
         	allSwitches.addAll(settings.hues)
@@ -257,8 +259,11 @@ def onLocation(evt) {
         
 		        def name = "${it.id}_${mode.tr(' !+', '___')}"
     		    TRACE("name: ${name}")
+
         		def value = settings[name]
 		        TRACE("value: ${value}")
+
+
     		    if (value != null) {
         		    if (value == 'on') {
             		    TRACE("Turning '${it.displayName}' on")
@@ -268,11 +273,9 @@ def onLocation(evt) {
         		        it.off()
    	
     	        	} else {
-        	        	value = value.toInteger()
-	            	    if (value > 99) value = 98
-    	            	TRACE("Setting '${it.displayName}' level to ${value}")
-	    	            it.setLevel(value)
-    	    	    }
+                        value = value.toInteger()
+                        initiateSetLevel(it, value)
+                    }
 	        	}	
 		    }
             
@@ -282,6 +285,73 @@ def onLocation(evt) {
     state.lastMode = state.currentMode
 
 }
+
+
+// Decide whether the device in question wants to be set gently or not
+// then initiate that setting
+def initiateSetLevel(device, value) {
+    String mode = state.currentMode
+    def nameGentle = "${device.id}_${mode.tr(' !+', '___')}_gentle"
+    def gentle = settings[nameGentle]
+    TRACE("nameGentle: ${nameGentle}")
+    TRACE("gentle: ${gentle}")
+
+    if (gentle) {
+        gentlySetLevel(device, value)
+    } else {
+        instantSetLevel(device, value)
+    }
+}
+
+
+// For a device determined to be non-gentle, apply the new level now 
+def instantSetLevel(device, value) {
+    TRACE("INSTANT Setting '${device.displayName}' level to ${value}")
+    if (value > 99) value = 98
+    device.setLevel(value)
+    state.pendingGentleUpdate[device.id] = 0;
+}
+
+// For a device determined to be gentle, apply the new level now if the device is off,
+// else note that the gentle setting needs to be applied if/when possible
+// (by subscribing to switch off events)
+def gentlySetLevel(device,value) {
+    TRACE("GENTLY Setting '${device.displayName}' level to ${value}")
+    if (device.latestValue("switch").toString() == "off") {
+        log.debug "${device.displayName} is off - applying update now"
+        applyGentleLevel(device, value)
+        state.pendingGentleUpdate[device.id] = 0
+    } else {
+        log.debug "NOT applying the update to ${device.displayName} because it's on"
+        state.pendingGentleUpdate[device.id] = value
+    }
+}
+
+// Time to apply a gentle new level to the physical device.  This means setting the new level
+// and immediately turning the device back off.  This is written to leverage
+// bravenel's modified dimmer device type which supports resetLevel (handling
+// the "change level then switch off" bit inside the device.  But it uses try/catch
+// to fallback for more conventional types
+
+// see https://github.com/bravenel/SmartThings/blob/master/Dimmer%20Switch%20with%20Off for bravenel's
+// modified device type
+
+def applyGentleLevel(device, value) {
+    log.debug "applying the update to ${device.displayName}"
+    if (value > 99) value = 98
+    try {
+        device.resetLevel(value)
+    } catch (Exception e) {
+        // in case it does not have our modified device type
+        log.warn "${device.displayName} does not support resetLevel, using setLevel/off"
+        device.setLevel(value,1)
+        device.setLevel(1,1) // included to speed up the perceived rampdown on Jasco dimmers, which are slow to off()
+        device.off()
+    }
+    
+    state.pendingGentleUpdate[device.id] = 0; // note that this makes the gentle level "non-persistent".  may want to add a 3rd option that skips this.
+}
+
 
 def newLevelCheck(evt) {
 	log.info "newLevel: $evt.name: $evt.value"
@@ -350,7 +420,7 @@ def resetLevel() {
 	    	        value = value.toInteger()
     	    	    if (value > 99) value = 98 {
 	    	    	    TRACE("Setting '${it.displayName}' level to ${value}")
-    	    	    	it.setLevel(value)
+    	    	    	initiateSetLevel(it, value)
         			}
         		}
 			}
@@ -385,8 +455,30 @@ private def initialize() {
     subscribe(monitorThese, "level", newLevelCheck)
 
 	runIn (150, "pollMonitored") 
-    
+    state.pendingGentleUpdate = [:]
+    subscribe(dimmers, "switch", switchHandler)
+
+
     STATE()
+}
+
+
+def switchHandler(evt) {
+    log.trace "switchHandler: ${evt.device} ${evt.value}"
+    
+    if (evt.value == "off") {
+        def device = dimmers.find {it.id == evt.deviceId}
+        if (device != null) {
+            log.debug "Off event on dimmer ${device.displayName}"
+            def gentleUpdateValue = state.pendingGentleUpdate[device.id]
+            if (gentleUpdateValue > 0) {
+                log.debug "Gentle device ${device.displayName} now ready for update to ${gentleUpdateValue}"
+                gentlySetLevel(device, gentleUpdateValue)
+            } else {
+                log.debug "No gentle update to be applied to ${device.displayName}.  gentleUpdateValue is ${gentleUpdateValue}"
+            }
+        }
+    }
 }
 
 
